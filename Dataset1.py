@@ -45,10 +45,12 @@ _context: dict = {
 def get_all_parsed_sms() -> str:
     """Reads the sms.json file and parses each raw SMS entry from its unstructured text block into a structured format."""
     try:
-        with open('sms.json', 'r') as f:
+        # Lettura diretta dalla root
+        with open('sms.json', 'r', encoding='utf-8') as f:
             data = json.load(f)
         
         parsed_list = []
+        # Pattern per estrarre mittente, data e messaggio 
         pattern = r"From: (.*)\nTo: (.*)\nDate: (.*)\nMessage: (.*)"
         for entry in data:
             raw_text = entry.get("sms", "")
@@ -61,7 +63,7 @@ def get_all_parsed_sms() -> str:
                 })
         return json.dumps(parsed_list, indent=2)
     except FileNotFoundError:
-        return "Errore: file sms.json non trovato."
+        return "Errore: file sms.json non trovato nella root."
     except Exception as e:
         return f"Errore durante il parsing: {str(e)}"
 
@@ -136,20 +138,20 @@ def check_recipient_known() -> str:
 # ===========================================================================
 
 def _load_data():
-    locs = pd.DataFrame(json.loads(Path("locations.json").read_text()))
+    # Caricamento diretto dalla root con encoding utf-8 per i nomi francesi/italiani
+    locs = pd.DataFrame(json.loads(Path("locations.json").read_text(encoding='utf-8')))
     locs["timestamp"] = pd.to_datetime(locs["timestamp"])
     
     txns = pd.read_csv("transactions.csv")
     txns["timestamp"] = pd.to_datetime(txns["timestamp"])
     
-    users = pd.DataFrame(json.loads(Path("users.json").read_text()))
+    users = pd.DataFrame(json.loads(Path("users.json").read_text(encoding='utf-8')))
     
+    # Mapping IBAN -> Biotag per collegare i cittadini alle loro transazioni [cite: 56, 77]
     iban_to_biotag = {}
     for _, row in txns.iterrows():
         if pd.notna(row.get("sender_iban")) and pd.notna(row.get("sender_id")):
             iban_to_biotag[row["sender_iban"]] = row["sender_id"]
-        if pd.notna(row.get("recipient_iban")) and pd.notna(row.get("recipient_id")):
-            iban_to_biotag[row["recipient_iban"]] = row["recipient_id"]
     
     users["biotag"] = users["iban"].map(iban_to_biotag)
     return locs, txns, users
