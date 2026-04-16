@@ -1,11 +1,14 @@
 import os
 import json
 import re
+import ulid
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain.agents import create_agent
 from langchain.tools import tool
 from langchain_core.messages import HumanMessage
+from langfuse import Langfuse, observe
+from langfuse.langchain import CallbackHandler
 
 # Carica variabili d'ambiente
 load_dotenv()
@@ -175,3 +178,47 @@ Linee guida score:
 - 0.6-1.0: anomalie gravi""",
     tools=[get_user_profile, get_user_history, compute_behavioral_stats, check_recipient_known]
 )
+
+
+
+# Initialize Langfuse client
+langfuse_client = Langfuse(
+    public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
+    secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
+    host=os.getenv("LANGFUSE_HOST", "https://challenges.reply.com/langfuse")
+)
+
+def generate_session_id():
+    """Generate a unique session ID using TEAM_NAME and ULID."""
+    # session_id must not contain blank spaces; TEAM_NAME may include spaces—replace with "-".
+    team = os.getenv("TEAM_NAME", "tutorial").replace(" ", "-")
+    return f"{team}-{ulid.new().str}"
+
+def invoke_langchain(model, prompt, langfuse_handler, session_id):
+    """Invoke LangChain with the given prompt and Langfuse handler."""
+    messages = [HumanMessage(content=prompt)]
+    response = model.invoke(
+        messages,
+        config={
+            "callbacks": [langfuse_handler],
+            "metadata": {"langfuse_session_id": session_id},
+        },
+    )
+    return response.content
+
+@observe()
+def run_llm_call(session_id, model, prompt):
+    """Run a single LangChain invocation and track it in Langfuse."""
+    # Pass session_id via LangChain metadata for session grouping
+    # Create Langfuse callback handler for automatic generation tracking
+    # The handler will attach to the current trace created by @observe()
+    langfuse_handler = CallbackHandler()
+
+    # Invoke LangChain with Langfuse handler to track tokens and costs
+    response = invoke_langchain(model, prompt, langfuse_handler, session_id)
+
+    return response
+
+print("✓ Langfuse initialized successfully")
+print(f"✓ Public key: {os.getenv('LANGFUSE_PUBLIC_KEY', 'Not set')[:20]}...")
+print("✓ Helper functions ready: generate_session_id(), invoke_langchain(), run_llm_call()")
