@@ -328,3 +328,7 @@ def run_llm_call(session_id, agent, prompt):
 
 print("✓ Langfuse initialized successfully")
 print("✓ Multi-Agent system ready (sms_agent, profile_agent, location_agent, master_agent)")
+
+# Esempio di invocazione del master_agent con un prompt di test
+response = master_agent.invoke({"messages": [HumanMessage("Write the IDs of the transactions that are anomalous based on sms content, user profile and location coherency.")], })
+print(response["messages"][-1].content)
