@@ -186,6 +186,223 @@ Linee guida score:
     tools=[get_user_profile, get_user_history, compute_behavioral_stats, check_recipient_known]
 )
 
+# -----------------------LocationAgent tools----------------------------
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+def _load_data():
+    locs = pd.DataFrame(json.loads(Path("locations.json").read_text()))
+    locs["timestamp"] = pd.to_datetime(locs["timestamp"])
+    
+    txns = pd.read_csv("transactions.csv")
+    txns["timestamp"] = pd.to_datetime(txns["timestamp"])
+    
+    users = pd.DataFrame(json.loads(Path("users.json").read_text()))
+    
+    # Map IBAN to biotag
+    iban_to_biotag = {}
+    for _, row in txns.iterrows():
+        if pd.notna(row.get("sender_iban")) and pd.notna(row.get("sender_id")):
+            iban_to_biotag[row["sender_iban"]] = row["sender_id"]
+        if pd.notna(row.get("recipient_iban")) and pd.notna(row.get("recipient_id")):
+            iban_to_biotag[row["recipient_iban"]] = row["recipient_id"]
+    
+    users["biotag"] = users["iban"].map(iban_to_biotag)
+    return locs, txns, users
+
+
+_locs, _txns, _users = _load_data()
+
+
+# ---------------------------------------------------------------------------
+# Core distance function
+# ---------------------------------------------------------------------------
+def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    R = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lng2 - lng1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+# ---------------------------------------------------------------------------
+# Tool input schemas
+# ---------------------------------------------------------------------------
+class UserCoherencyInput(BaseModel):
+    biotag: str = Field(description="User biotag (e.g., 'RGNR-LNAA-7FF-AUD-0')")
+    window_hours: int = Field(6, description="Hours around transaction to search for GPS ping")
+    max_plausible_kmh: float = Field(900.0, description="Maximum plausible travel speed in km/h")
+
+
+class AllUsersCoherencyInput(BaseModel):
+    window_hours: int = Field(6, description="Hours around transaction to search for GPS ping")
+    max_plausible_kmh: float = Field(900.0, description="Maximum plausible travel speed in km/h")
+
+
+# ---------------------------------------------------------------------------
+# LangChain Tools
+# ---------------------------------------------------------------------------
+@tool(args_schema=UserCoherencyInput)
+def get_user_coherency_score(
+    biotag: str,
+    window_hours: int = 6,
+    max_plausible_kmh: float = 900.0
+) -> dict:
+    """
+    Calculate coherency score (0-1) for a single user based on GPS-transaction alignment.
+    Score 1 = perfectly coherent, 0 = completely incoherent.
+    """
+    user = _users[_users["biotag"] == biotag]
+    if user.empty:
+        return {"error": f"User {biotag} not found"}
+    
+    home_lat = float(user.iloc[0]["residence"]["lat"])
+    home_lng = float(user.iloc[0]["residence"]["lng"])
+    
+    # Get user's transactions
+    user_txns = _txns[(_txns["sender_id"] == biotag) | (_txns["recipient_id"] == biotag)]
+    if user_txns.empty:
+        return {"biotag": biotag, "score": 1.0, "reason": "No transactions to verify"}
+    
+    user_locs = _locs[_locs["biotag"] == biotag]
+    violations = 0
+    total_weight = 0
+    
+    for _, txn in user_txns.iterrows():
+        # Find nearest GPS ping
+        txn_time = txn["timestamp"]
+        nearby = user_locs[abs(user_locs["timestamp"] - txn_time) <= timedelta(hours=window_hours)]
+        
+        weight = 1.0
+        if txn["transaction_type"] == "transfer":
+            weight = 0.3  # Transfers less location-dependent
+        elif txn["transaction_type"] in ["e-commerce", "direct debit"]:
+            weight = 0.1  # Online transactions location-independent
+        
+        total_weight += weight
+        
+        if nearby.empty:
+            violations += weight * 0.5  # Missing GPS = partial violation
+            continue
+        
+        # Check distances
+        for _, gps in nearby.iterrows():
+            dist = _haversine_km(gps["lat"], gps["lng"], home_lat, home_lng)
+            time_diff_h = abs((gps["timestamp"] - txn_time).total_seconds()) / 3600
+            
+            # Velocity check
+            if time_diff_h > 0:
+                speed = dist / time_diff_h
+                if speed > max_plausible_kmh and dist > 10:
+                    violations += weight
+                    break
+            # Distance check for in-person transactions
+            elif txn["transaction_type"] == "in-person payment" and dist > 100:
+                violations += weight * 0.8
+                break
+    
+    score = max(0.0, 1.0 - (violations / total_weight if total_weight > 0 else 0))
+    return {
+        "biotag": biotag,
+        "name": f"{user.iloc[0]['first_name']} {user.iloc[0]['last_name']}",
+        "coherency_score": round(score, 3),
+        "transactions_checked": len(user_txns),
+        "violations_weight": round(violations, 2),
+        "interpretation": "High coherence" if score > 0.8 else "Medium coherence" if score > 0.5 else "Low coherence"
+    }
+
+
+@tool(args_schema=AllUsersCoherencyInput)
+def get_all_users_coherency(
+    window_hours: int = 6,
+    max_plausible_kmh: float = 900.0
+) -> dict:
+    """
+    Calculate coherency scores (0-1) for all users in the system.
+    Returns ranked list with scores and summary statistics.
+    """
+    results = []
+    for biotag in _users["biotag"].dropna().unique():
+        result = get_user_coherency_score.invoke({
+            "biotag": biotag,
+            "window_hours": window_hours,
+            "max_plausible_kmh": max_plausible_kmh
+        })
+        if "error" not in result:
+            results.append(result)
+    
+    results.sort(key=lambda x: x["coherency_score"])
+    
+    return {
+        "total_users": len(results),
+        "average_score": round(sum(r["coherency_score"] for r in results) / len(results), 3),
+        "lowest_coherency": results[0] if results else None,
+        "highest_coherency": results[-1] if results else None,
+        "all_scores": results,
+        "risk_ranking": [
+            {
+                "rank": i + 1,
+                "biotag": r["biotag"],
+                "name": r["name"],
+                "score": r["coherency_score"],
+                "risk_level": "HIGH" if r["coherency_score"] < 0.5 else "MEDIUM" if r["coherency_score"] < 0.8 else "LOW"
+            }
+            for i, r in enumerate(results)
+        ]
+    }
+
+
+@tool
+def get_user_transaction_details(biotag: str) -> dict:
+    """
+    Get detailed transaction history with location context for a specific user.
+    """
+    user = _users[_users["biotag"] == biotag]
+    if user.empty:
+        return {"error": f"User {biotag} not found"}
+    
+    home = user.iloc[0]["residence"]
+    user_txns = _txns[(_txns["sender_id"] == biotag) | (_txns["recipient_id"] == biotag)]
+    user_locs = _locs[_locs["biotag"] == biotag]
+    
+    details = []
+    for _, txn in user_txns.iterrows():
+        nearby = user_locs[abs(user_locs["timestamp"] - txn["timestamp"]) <= timedelta(hours=6)]
+        
+        detail = {
+            "transaction_id": txn["transaction_id"],
+            "timestamp": str(txn["timestamp"]),
+            "type": txn["transaction_type"],
+            "amount": txn["amount"],
+            "location_stated": txn.get("location", "N/A"),
+        }
+        
+        if not nearby.empty:
+            closest = nearby.iloc[(nearby["timestamp"] - txn["timestamp"]).abs().argmin()]
+            detail["gps_location"] = {
+                "city": closest["city"],
+                "distance_from_home_km": round(
+                    _haversine_km(closest["lat"], closest["lng"], float(home["lat"]), float(home["lng"])), 1
+                ),
+                "time_diff_hours": round(abs((closest["timestamp"] - txn["timestamp"]).total_seconds()) / 3600, 2)
+            }
+        else:
+            detail["gps_location"] = None
+            
+        details.append(detail)
+    
+    return {
+        "biotag": biotag,
+        "name": f"{user.iloc[0]['first_name']} {user.iloc[0]['last_name']}",
+        "home": home,
+        "transaction_count": len(details),
+        "transactions": details
+    }
+
+# -----------------------LocationAgent tools----------------------------
+
+
 
 
 # Initialize Langfuse client
