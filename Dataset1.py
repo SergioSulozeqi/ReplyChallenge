@@ -322,13 +322,145 @@ def invoke_langchain(model, prompt, langfuse_handler, session_id):
 @observe()
 def run_llm_call(session_id, agent, prompt):
     langfuse_handler = CallbackHandler()
-    # Da notare: per eseguire il master_agent, passeremo l'agent invece del model nudo
     response = invoke_langchain(agent, prompt, langfuse_handler, session_id)
     return response
 
 print("✓ Langfuse initialized successfully")
 print("✓ Multi-Agent system ready (sms_agent, profile_agent, location_agent, master_agent)")
 
-# Esempio di invocazione del master_agent con un prompt di test
-response = master_agent.invoke({"messages": [HumanMessage("Write the IDs of the transactions that are anomalous based on sms content, user profile and location coherency.")], })
-print(response["messages"][-1].content)
+# ===========================================================================
+# LOAD AND PREPARE DATA FOR ANALYSIS
+# ===========================================================================
+
+# Load the full dataset
+txns_df = pd.read_csv("transactions.csv")
+txns_df["timestamp"] = pd.to_datetime(txns_df["timestamp"])
+
+# Load user profiles for context
+with open("users.json", "r") as f:
+    users_data = json.load(f)
+
+# Create biotag to user mapping
+biotag_to_user = {}
+iban_to_biotag = {}
+for _, row in txns_df.iterrows():
+    if pd.notna(row.get("sender_iban")) and pd.notna(row.get("sender_id")):
+        iban_to_biotag[row["sender_iban"]] = row["sender_id"]
+    if pd.notna(row.get("recipient_iban")) and pd.notna(row.get("recipient_id")):
+        iban_to_biotag[row["recipient_iban"]] = row["recipient_id"]
+
+for user in users_data:
+    biotag = iban_to_biotag.get(user["iban"])
+    if biotag:
+        biotag_to_user[biotag] = user
+        user["biotag"] = biotag
+
+# Get unique biotags from users
+active_biotags = [u["biotag"] for u in users_data if "biotag" in u]
+
+# Prepare sample transactions for analysis (take a few interesting ones)
+sample_txns = txns_df[
+    (txns_df["sender_id"].isin(active_biotags)) | 
+    (txns_df["recipient_id"].isin(active_biotags))
+].head(10)  # Limit to 10 for demo
+
+# Create context for each transaction to analyze
+analysis_prompts = []
+for _, txn in sample_txns.iterrows():
+    biotag = txn["sender_id"] if pd.notna(txn["sender_id"]) else txn["recipient_id"]
+    user = biotag_to_user.get(biotag, {})
+    
+    # Set the global context for tools that need it
+    _context["transaction"] = txn.to_dict()
+    _context["user_profile"] = user
+    
+    # Get user's transaction history
+    user_history = txns_df[
+        (txns_df["sender_id"] == biotag) | 
+        (txns_df["recipient_id"] == biotag)
+    ].sort_values("timestamp")
+    _context["history"] = user_history.to_dict(orient="records")
+
+# ===========================================================================
+# ANALYZE ALL TRANSACTIONS
+# ===========================================================================
+
+print("\n" + "=" * 80)
+print("FRAUD ANALYSIS REPORT")
+print("=" * 80)
+
+for idx, (_, txn) in enumerate(sample_txns.iterrows(), 1):
+    biotag = txn["sender_id"] if pd.notna(txn["sender_id"]) else txn["recipient_id"]
+    user = biotag_to_user.get(biotag, {})
+    
+    # Update context for this transaction
+    _context["transaction"] = txn.to_dict()
+    _context["user_profile"] = user
+    user_history = txns_df[
+        (txns_df["sender_id"] == biotag) | 
+        (txns_df["recipient_id"] == biotag)
+    ].sort_values("timestamp")
+    _context["history"] = user_history.to_dict(orient="records")
+    
+    # Create analysis prompt with all necessary data
+    analysis_prompt = f"""
+Analyze this transaction for fraud risk. Here's the transaction data:
+{json.dumps(txn.to_dict(), default=str, indent=2)}
+
+User profile:
+{json.dumps(user, indent=2) if user else 'Unknown user'}
+
+Transaction history for this user (last 5):
+{json.dumps([t for t in _context['history'][-5:]], default=str, indent=2)}
+
+Please:
+1. Delegate to profile_agent to check behavioral anomalies
+2. Delegate to sms_agent to check for phishing indicators
+3. Delegate to location_agent with biotag '{biotag}' to check GPS coherence
+4. Combine findings into a final fraud score (0.0-1.0)
+
+Output ONLY valid JSON with: final_fraud_score, is_fraud, master_reasoning
+"""
+    
+    print(f"\n📊 Analyzing Transaction #{idx}: {txn['transaction_id'][:8]}...")
+    print(f"   User: {user.get('first_name', 'Unknown')} {user.get('last_name', '')}")
+    print(f"   Amount: €{txn['amount']} | Type: {txn['transaction_type']}")
+    
+    try:
+        # Invoke master agent with full context
+        response = master_agent.invoke({
+            "messages": [HumanMessage(content=analysis_prompt)]
+        })
+        
+        # Extract the final response
+        final_output = response["messages"][-1].content
+        
+        # Try to parse as JSON
+        try:
+            # Find JSON in response (in case there's extra text)
+            json_match = re.search(r'\{.*\}', final_output, re.DOTALL)
+            if json_match:
+                result = json.loads(json_match.group())
+                print(f"   ✓ Fraud Score: {result.get('final_fraud_score', 'N/A')}")
+                print(f"   ✓ Is Fraud: {result.get('is_fraud', 'N/A')}")
+                print(f"   ✓ Reasoning: {result.get('master_reasoning', 'N/A')[:100]}...")
+            else:
+                print(f"   ⚠️ Could not parse JSON from response")
+                print(f"   Raw response: {final_output[:200]}...")
+        except json.JSONDecodeError as e:
+            print(f"   ⚠️ JSON parse error: {e}")
+            print(f"   Raw response: {final_output[:200]}...")
+            
+    except Exception as e:
+        print(f"   ❌ Error analyzing transaction: {e}")
+
+print("\n" + "=" * 80)
+print("ANALYSIS COMPLETE")
+print("=" * 80)
+
+# ===========================================================================
+# SUMMARY OF ALL USERS COHERENCY (Direct tool call example)
+# ===========================================================================
+print("\n📍 Location Coherency Summary (All Users):")
+coherency_result = get_all_users_coherency.invoke({"window_hours": 6, "max_plausible_kmh": 900.0})
+print(f"   Average coherence score: {coherency_result.get('average_score', 'N/A')}")
