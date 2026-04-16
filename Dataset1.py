@@ -6,9 +6,16 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain.agents import create_agent
 from langchain.tools import tool
-from langchain_core.messages import HumanMessage
+#from langchain_core.messages import HumanMessage
 from langfuse import Langfuse, observe
 from langfuse.langchain import CallbackHandler
+
+
+import numpy as np
+from datetime import datetime
+from collections import Counter
+from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, ToolMessage, SystemMessage
 
 # Carica variabili d'ambiente
 load_dotenv()
